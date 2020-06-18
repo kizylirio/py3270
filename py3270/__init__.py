@@ -11,6 +11,9 @@ import subprocess
 import time
 import warnings
 import errno
+import socket
+from contextlib import closing
+
 
 log = logging.getLogger(__name__)
 
@@ -163,6 +166,12 @@ class ExecutableApp(object):
     def readline(self):
         return self.sp.stdout.readline()
 
+    def find_free_port(self):
+        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+            s.bind(('', 0))
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            return s.getsockname()[1]
+
 
 class X3270App(ExecutableApp):
     executable = "x3270"
@@ -174,10 +183,70 @@ class X3270App(ExecutableApp):
     args = ["-xrm", "x3270.unlockDelay: False", "-script"]
 
 
+# class S3270App(ExecutableApp):
+#     executable = "s3270"
+#     # see notes for args in x3270App
+#     args = ["-xrm", "s3270.unlockDelay: False"]
+
 class S3270App(ExecutableApp):
     executable = "s3270"
     # see notes for args in x3270App
     args = ["-xrm", "s3270.unlockDelay: False"]
+    #script_port = 17938
+
+    def __init__(self, args):
+        if args:
+            self.args = S3270App.args + args
+        self.sp = None
+        self.socket_fh = None
+        self.script_port = self.find_free_port()
+
+    def connect(self, host):
+        self.spawn_app(host)
+        self.make_socket()
+        return True
+
+    def close(self):
+        # failing to close the socket ourselves will result in a ResourceWarning
+        self.socket.close()
+
+    def spawn_app(self, host):
+        args = ["start", "/wait", self.executable] + self.args
+        args.extend(["-scriptport", str(self.script_port), host])
+        self.sp = subprocess.Popen(
+            args,
+            shell=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def make_socket(self):
+        self.socket = sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        count = 0
+        while count < 15:
+            try:
+                sock.connect(("localhost", self.script_port))
+                break
+            except socket.error as e:
+                log.warn(e)
+                if e.errno != errno.ECONNREFUSED:
+                    raise
+                time.sleep(1)
+                count += 1
+        # open a file handle for the socket that can both read and write, using bytestrings
+        self.socket_fh = sock.makefile(mode="rwb")
+
+    def write(self, data):
+        if self.socket_fh is None:
+            raise NotConnectedException
+        self.socket_fh.write(data)
+        self.socket_fh.flush()
+
+    def readline(self):
+        if self.socket_fh is None:
+            raise NotConnectedException
+        return self.socket_fh.readline()
 
 
 class NotConnectedException(Exception):
@@ -188,13 +257,14 @@ class Wc3270App(ExecutableApp):
     executable = "wc3270"
     # see notes for args in x3270App
     args = ["-xrm", "wc3270.unlockDelay: False"]
-    script_port = 17938
+    #script_port = 17938
 
     def __init__(self, args):
         if args:
             self.args = Wc3270App.args + args
         self.sp = None
         self.socket_fh = None
+        self.script_port = self.find_free_port()
 
     def connect(self, host):
         self.spawn_app(host)
